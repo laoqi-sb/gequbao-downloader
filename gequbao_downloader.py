@@ -5,10 +5,11 @@
   python gequbao_downloader.py <歌曲ID或URL>
   python gequbao_downloader.py search <关键词>
   python gequbao_downloader.py batch <ID1,ID2,...>
+  加 --hd 获取高品质版本
 示例:
   python gequbao_downloader.py 3322385
-  python gequbao_downloader.py https://www.gequbao.net/music/3322385
   python gequbao_downloader.py search Vertigo
+  python gequbao_downloader.py search "Montagem Bandidio" --hd
   python gequbao_downloader.py batch 3322385,1255744
 """
 
@@ -20,6 +21,7 @@ import time
 import html
 import http.cookiejar
 import urllib.request
+import urllib.parse
 import ssl
 
 ssl_ctx = ssl.create_default_context()
@@ -43,42 +45,7 @@ class Session:
 
     def get(self, url):
         req = urllib.request.Request(url, headers={"User-Agent": UA, "Referer": "https://www.gequbao.net/"})
-        return self.opener.open(req, timeout=15).read().decode("utf-8", errors="ignore")
-
-    def post_json(self, url, payload):
-        data = json.dumps(payload).encode("utf-8")
-        req = urllib.request.Request(
-            url,
-            data=data,
-            headers={
-                "User-Agent": UA,
-                "Content-Type": "application/json",
-                "Referer": "https://www.gequbao.net/",
-            },
-            method="POST",
-        )
-        return json.loads(self.opener.open(req, timeout=15).read().decode())
-
-    def download(self, url, filepath):
-        req = urllib.request.Request(url, headers={"User-Agent": UA, "Referer": "https://www.gequbao.net/"})
-        resp = self.opener.open(req, timeout=120)
-        total = int(resp.headers.get("Content-Length", 0))
-        downloaded = 0
-        with open(filepath, "wb") as f:
-            while True:
-                chunk = resp.read(65536)
-                if not chunk:
-                    break
-                f.write(chunk)
-                downloaded += len(chunk)
-                if total > 0:
-                    pct = downloaded * 100 / total
-                    bar = "=" * int(pct // 2) + ">" + " " * (50 - int(pct // 2))
-                    print(f"\r    [{bar}] {pct:.1f}% ({downloaded}/{total})", end="", flush=True)
-                else:
-                    print(f"\r    {downloaded} bytes", end="", flush=True)
-        print()
-        return downloaded
+        return self.opener.open(req, timeout=20).read().decode("utf-8", errors="ignore")
 
 
 def extract_id(s):
@@ -115,7 +82,7 @@ def download_one(session, song_id, hd=False):
         cl = int(resp.headers.get("Content-Length", 0))
 
         if "audio" not in ct and cl < 100000:
-            print(f"[-] Got non-audio response: {ct}, {cl} bytes")
+            print(f"[-] Failed: {ct}, {cl} bytes")
             return False
 
         safe = re.sub(r'[\\/:*?"<>|]', "_", f"{artist} - {title}")
@@ -146,7 +113,7 @@ def download_one(session, song_id, hd=False):
         print()
 
         if downloaded < 10000:
-            print(f"[!] Warning: file too small ({downloaded} bytes), may be incomplete")
+            print(f"[!] Too small ({downloaded} bytes), removing")
             os.remove(filepath)
             return False
 
@@ -160,15 +127,66 @@ def download_one(session, song_id, hd=False):
 
 def search(session, keyword):
     print(f"[*] Searching: {keyword}")
-    result = session.post_json("https://www.gequbao.net/api/search", {"keyword": keyword, "page": 1})
-    songs = result.get("data", {}).get("list", [])
-    if not songs:
+    page = session.get(f"https://www.gequbao.net/s/{urllib.parse.quote(keyword)}")
+
+    results = []
+    seen = set()
+    for m in re.finditer(
+        r'href="/search_music\?song_id=(\d+)&kwd=[^"]*?&title=([^&"]*)&singer=([^&"]*)',
+        page,
+    ):
+        kuwo_id = m.group(1)
+        if kuwo_id in seen:
+            continue
+        seen.add(kuwo_id)
+        title = html.unescape(urllib.parse.unquote_plus(m.group(2)))
+        singer = html.unescape(urllib.parse.unquote_plus(m.group(3)))
+        results.append({"kuwo_id": kuwo_id, "title": title, "singer": singer})
+
+    if not results:
         print("[-] No results")
         return []
-    print(f"[+] Found {len(songs)} songs:")
-    for i, s in enumerate(songs):
-        print(f"    {i+1}. {html.unescape(s.get('name', '?'))} - {html.unescape(s.get('author', '?'))}  (ID: {s.get('id', '')})")
-    return songs
+
+    print(f"[+] Found {len(results)} songs:")
+    for i, s in enumerate(results):
+        print(f"    {i+1}. {s['title']} - {s['singer']}")
+
+    return results
+
+
+def resolve_and_download(session, result, hd=False):
+    title = result["title"]
+    singer = result["singer"]
+    kuwo_id = result["kuwo_id"]
+    print(f"\n[*] Resolving: {title} - {singer}")
+
+    search_url = (
+        f"https://www.gequbao.net/search_music?"
+        f"song_id={kuwo_id}&kwd={urllib.parse.quote(title)}"
+        f"&title={urllib.parse.quote(title)}&singer={urllib.parse.quote(singer)}&page=1"
+    )
+    page = session.get(search_url)
+
+    m = re.search(r'window\.appData\s*=\s*(\{.*?\});', page)
+    if not m:
+        print("[-] Could not find song data")
+        return False
+
+    try:
+        data = json.loads(m.group(1))
+        mp3_id = data.get("mp3_id")
+        mp3_title = html.unescape(data.get("mp3_title", title))
+        mp3_author = html.unescape(data.get("mp3_author", singer))
+    except Exception:
+        print("[-] Failed to parse song data")
+        return False
+
+    if not mp3_id:
+        print("[-] No mp3_id found")
+        return False
+
+    print(f"[*] Found gequbao ID: {mp3_id} ({mp3_title} - {mp3_author})")
+    return download_one(session, str(mp3_id), hd=hd)
 
 
 def main():
@@ -187,16 +205,19 @@ def main():
         if not keyword:
             print("Usage: python gequbao_downloader.py search <keyword>")
             return
-        songs = search(session, keyword)
-        if not songs:
+        results = search(session, keyword)
+        if not results:
             return
-        choice = input(f"\nSelect (1-{len(songs)}): ").strip()
-        try:
-            song_id = songs[int(choice) - 1]["id"]
-        except (ValueError, IndexError):
-            print("[-] Invalid")
-            return
-        download_one(session, song_id, hd=hd)
+
+        if len(results) == 1:
+            resolve_and_download(session, results[0], hd=hd)
+        else:
+            choice = input(f"\nSelect (1-{len(results)}): ").strip()
+            try:
+                idx = int(choice) - 1
+                resolve_and_download(session, results[idx], hd=hd)
+            except (ValueError, IndexError):
+                print("[-] Invalid")
 
     elif arg.lower().startswith("batch"):
         ids = arg[5:].strip().split(",")
